@@ -1,0 +1,319 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberExists(businessId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/businesses/$(businessId)/users/$(request.auth.uid));
+    }
+
+    function member(businessId) {
+      return get(/databases/$(database)/documents/businesses/$(businessId)/users/$(request.auth.uid)).data;
+    }
+
+    function isOwner(businessId) {
+      return memberExists(businessId)
+        && member(businessId).role == 'owner'
+        && member(businessId).active == true;
+    }
+
+    function isEmployee(businessId) {
+      return memberExists(businessId)
+        && (member(businessId).role == 'employee' || member(businessId).role == 'pegawai')
+        && member(businessId).active == true
+        && (member(businessId).role == 'pegawai' || member(businessId).status == 'active');
+    }
+
+    function ownerProfileAfter(businessId) {
+      let ownerPath = /databases/$(database)/documents/users/$(request.auth.uid);
+      return signedIn()
+        && existsAfter(ownerPath)
+        && getAfter(ownerPath).data.uid == request.auth.uid
+        && getAfter(ownerPath).data.role == 'owner'
+        && getAfter(ownerPath).data.status == 'active'
+        && getAfter(ownerPath).data.businessId == businessId;
+    }
+
+    function ownerMembershipAfter(businessId) {
+      let memberPath = /databases/$(database)/documents/businesses/$(businessId)/users/$(request.auth.uid);
+      return existsAfter(memberPath)
+        && getAfter(memberPath).data.uid == request.auth.uid
+        && getAfter(memberPath).data.role == 'owner'
+        && getAfter(memberPath).data.status == 'active'
+        && getAfter(memberPath).data.active == true
+        && getAfter(memberPath).data.businessId == businessId;
+    }
+
+    function isOwnerAfter(businessId) {
+      return ownerProfileAfter(businessId) && ownerMembershipAfter(businessId);
+    }
+
+    function employeeMembershipAfter(businessId, userId) {
+      let memberPath = /databases/$(database)/documents/businesses/$(businessId)/users/$(userId);
+      return existsAfter(memberPath)
+        && getAfter(memberPath).data.uid == userId
+        && getAfter(memberPath).data.authUid == userId
+        && getAfter(memberPath).data.role == 'employee'
+        && getAfter(memberPath).data.businessId == businessId
+        && getAfter(memberPath).data.employeeId == request.resource.data.employeeId
+        && getAfter(memberPath).data.email == request.resource.data.email
+        && getAfter(memberPath).data.status == request.resource.data.status
+        && getAfter(memberPath).data.active == request.resource.data.active;
+    }
+
+    function employeeOwnsNewRecord(businessId) {
+      return request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.businessId == businessId;
+    }
+
+    function validEmployeeExpense(businessId) {
+      return employeeOwnsNewRecord(businessId)
+        && request.resource.data.quantity is number
+        && request.resource.data.quantity > 0
+        && request.resource.data.unitPrice is number
+        && request.resource.data.unitPrice >= 0
+        && request.resource.data.total == request.resource.data.quantity * request.resource.data.unitPrice;
+    }
+
+    function validEmployeeSale(businessId) {
+      let menuPath = /databases/$(database)/documents/businesses/$(businessId)/cashierMenus/$(request.resource.data.menuId);
+      return employeeOwnsNewRecord(businessId)
+        && request.resource.data.employeeId == request.auth.uid
+        && request.resource.data.qty is number
+        && request.resource.data.qty > 0
+        && request.resource.data.sellingPrice is number
+        && request.resource.data.sellingPrice >= 0
+        && request.resource.data.total == request.resource.data.qty * request.resource.data.sellingPrice
+        && exists(menuPath)
+        && get(menuPath).data.status == 'aktif'
+        && get(menuPath).data.sellingPrice == request.resource.data.sellingPrice;
+    }
+
+    match /users/{userId} {
+      allow create: if signedIn()
+        && ((userId == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.email == request.auth.token.email
+          && request.resource.data.role == 'owner'
+          && request.resource.data.businessId is string
+          && request.resource.data.businessId.size() > 0
+          && request.resource.data.status == 'active'
+          && request.resource.data.keys().hasOnly([
+            'uid', 'email', 'name', 'role', 'businessId', 'status',
+            'createdAt', 'updatedAt'
+          ]))
+        || (request.resource.data.role == 'employee'
+          && userId == request.resource.data.uid
+          && request.resource.data.authUid == userId
+          && request.resource.data.email is string
+          && request.resource.data.employeeId is string
+          && request.resource.data.employeeId.size() >= 3
+          && request.resource.data.employeeId.size() <= 20
+          && request.resource.data.businessId is string
+          && request.resource.data.status in ['active', 'inactive']
+          && request.resource.data.active == (request.resource.data.status == 'active')
+          && request.resource.data.keys().hasOnly([
+            'uid', 'authUid', 'employeeId', 'name', 'role', 'businessId',
+            'status', 'active', 'email', 'createdAt', 'updatedAt'
+          ])
+          && isOwner(request.resource.data.businessId)
+          && employeeMembershipAfter(request.resource.data.businessId, userId)));
+      allow read: if signedIn()
+        && (userId == request.auth.uid
+          || (resource.data.role == 'employee'
+            && isOwner(resource.data.businessId)));
+      allow update: if isOwner(resource.data.businessId)
+        && resource.data.role == 'employee'
+        && request.resource.data.uid == userId
+        && request.resource.data.authUid == userId
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.employeeId == resource.data.employeeId
+        && request.resource.data.businessId == resource.data.businessId
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['name', 'status', 'active', 'updatedAt'])
+        && request.resource.data.status in ['active', 'inactive']
+        && request.resource.data.active == (request.resource.data.status == 'active');
+      allow delete: if false;
+    }
+
+    match /businesses/{businessId} {
+      allow create: if signedIn()
+        && request.resource.data.id == businessId
+        && request.resource.data.ownerId == request.auth.uid
+        && ownerProfileAfter(businessId)
+        && ownerMembershipAfter(businessId);
+      allow read, update, delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/users/{userId} {
+      allow create: if signedIn()
+        && ((userId == request.auth.uid
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.role == 'owner'
+          && request.resource.data.businessId == businessId
+          && request.resource.data.status == 'active'
+          && request.resource.data.active == true
+          && request.resource.data.keys().hasOnly([
+            'uid', 'email', 'name', 'role', 'businessId', 'status',
+            'active', 'createdAt', 'updatedAt'
+          ])
+          && ownerProfileAfter(businessId))
+        || (isOwner(businessId)
+          && userId == request.resource.data.authUid
+          && request.resource.data.uid == userId
+          && request.resource.data.role == 'employee'
+          && request.resource.data.businessId == businessId
+          && request.resource.data.status == 'active'
+          && request.resource.data.active == true
+          && request.resource.data.email is string
+          && request.resource.data.employeeId is string
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 100
+          && request.resource.data.keys().hasOnly([
+            'uid', 'authUid', 'employeeId', 'name', 'role', 'businessId',
+            'status', 'active', 'email', 'createdAt', 'updatedAt'
+          ])));
+      allow read: if isOwner(businessId) || (signedIn() && userId == request.auth.uid);
+      allow update: if isOwner(businessId)
+        && resource.data.role == 'employee'
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.authUid == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.employeeId == resource.data.employeeId
+        && request.resource.data.businessId == businessId
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'active', 'updatedAt', 'name', 'uid', 'email'])
+        && request.resource.data.status in ['active', 'inactive']
+        && request.resource.data.email is string
+        && request.resource.data.email.matches('^[a-z0-9_-]{3,20}@internal\\.catatanusaha\\.app$')
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.active == (request.resource.data.status == 'active');
+      allow delete: if false;
+    }
+
+    match /businesses/{businessId}/employeeIds/{employeeId} {
+      allow read: if isOwner(businessId);
+      allow create: if isOwner(businessId)
+        && request.resource.data.employeeId == employeeId
+        && request.resource.data.employeeIdValue is string
+        && request.resource.data.businessId == businessId
+        && request.resource.data.authUid is string
+        && request.resource.data.email is string
+        && request.resource.data.status in ['active', 'inactive']
+        && request.resource.data.keys().hasOnly([
+          'employeeId', 'employeeIdValue', 'authUid', 'businessId', 'email',
+          'status', 'createdAt', 'updatedAt'
+        ]);
+      allow update: if isOwner(businessId)
+        && request.resource.data.employeeId == employeeId
+        && request.resource.data.employeeIdValue == resource.data.employeeIdValue
+        && request.resource.data.businessId == businessId
+        && request.resource.data.authUid == resource.data.authUid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updatedAt'])
+        && request.resource.data.status in ['active', 'inactive'];
+      allow delete: if false;
+    }
+
+    match /businesses/{businessId}/menus/{menuId} {
+      allow read: if isOwner(businessId);
+      allow create, update, delete: if isOwner(businessId) || isOwnerAfter(businessId);
+    }
+
+    // Employee-safe menu copies omit HPP and all owner-only recipe data.
+    match /businesses/{businessId}/cashierMenus/{menuId} {
+      allow read: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.status == 'aktif');
+      allow create, update: if (isOwner(businessId) || isOwnerAfter(businessId))
+        && request.resource.data.keys().hasOnly([
+          'id', 'name', 'category', 'sellingPrice', 'status', 'createdAt', 'updatedAt'
+        ]);
+      allow delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/sales/{saleId} {
+      allow read: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.createdBy == request.auth.uid);
+      allow create: if isOwner(businessId)
+        || (isEmployee(businessId) && validEmployeeSale(businessId)
+          && request.resource.data.keys().hasOnly([
+            'id', 'businessId', 'createdBy', 'userId', 'createdAt', 'updatedAt',
+            'menuId', 'menuName', 'qty', 'sellingPrice', 'total', 'date',
+            'paymentMethod', 'amountPaid', 'change', 'employeeId', 'shiftId'
+          ]));
+      allow update, delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/purchases/{purchaseId} {
+      allow read, create, update, delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/expenses/{expenseId} {
+      allow read: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.createdBy == request.auth.uid);
+      allow create: if isOwner(businessId)
+        || (isEmployee(businessId) && validEmployeeExpense(businessId)
+          && request.resource.data.keys().hasOnly([
+            'id', 'businessId', 'createdBy', 'userId', 'createdAt', 'updatedAt',
+            'itemName', 'title', 'category', 'date', 'quantity', 'unitPrice', 'total', 'amount', 'notes'
+          ]));
+      allow update: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.createdBy == request.auth.uid
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.businessId == businessId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'itemName', 'title', 'category', 'date', 'quantity',
+            'unitPrice', 'total', 'amount', 'notes', 'updatedAt'
+          ])
+          && request.resource.data.quantity is number
+          && request.resource.data.quantity > 0
+          && request.resource.data.unitPrice is number
+          && request.resource.data.unitPrice >= 0
+          && request.resource.data.total == request.resource.data.quantity * request.resource.data.unitPrice);
+      allow delete: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.createdBy == request.auth.uid);
+    }
+
+    match /businesses/{businessId}/capital/{capitalId} {
+      allow read, create, update, delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/shifts/{shiftId} {
+      allow read: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.employeeId == request.auth.uid);
+      allow create: if isEmployee(businessId)
+        && request.resource.data.employeeId == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isOwner(businessId)
+        || (isEmployee(businessId) && resource.data.employeeId == request.auth.uid
+          && request.resource.data.employeeId == request.auth.uid
+          && request.resource.data.status == 'CLOSED');
+      allow delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/salesPrivate/{saleId} {
+      allow read, create, update, delete: if isOwner(businessId);
+    }
+
+    match /businesses/{businessId}/settings/{document=**} {
+      allow read: if isOwner(businessId);
+      allow create, update, delete: if isOwner(businessId) || isOwnerAfter(businessId);
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
