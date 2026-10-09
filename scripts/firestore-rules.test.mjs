@@ -109,6 +109,7 @@ try {
 
   const unauthenticated = testEnvironment.unauthenticatedContext().firestore();
   const owner = testEnvironment.authenticatedContext('owner-a', { email: 'owner@example.test' }).firestore();
+  const otherOwner = testEnvironment.authenticatedContext('owner-b', { email: 'owner-b@example.test' }).firestore();
   const employee = testEnvironment.authenticatedContext('employee-a', { email: 'employee@example.test' }).firestore();
 
   await assertFails(getDoc(doc(unauthenticated, 'users/owner-a')), 'A: unauthenticated user cannot read owner profile');
@@ -220,7 +221,7 @@ try {
   const employeeRecord = {
     uid: employeeUid,
     authUid: employeeUid,
-    employeeId: 'NEW01',
+    employeeId: 'new01',
     name: 'New Employee',
     role: 'employee',
     businessId: 'business-a',
@@ -234,7 +235,7 @@ try {
   newEmployeeBatch.set(doc(owner, `businesses/business-a/users/${employeeUid}`), employeeRecord);
   newEmployeeBatch.set(doc(owner, 'businesses/business-a/employeeIds/NEW01'), {
     employeeId: 'NEW01',
-    employeeIdValue: 'NEW01',
+    employeeIdValue: 'new01',
     authUid: employeeUid,
     businessId: 'business-a',
     email: employeeEmail,
@@ -243,6 +244,21 @@ try {
     updatedAt: new Date(),
   });
   await assertSucceeds(newEmployeeBatch.commit(), 'Owner can create root and business employee profiles atomically');
+
+  await Promise.all([
+    assertFails(
+      updateDoc(doc(otherOwner, 'users/employee-new'), { name: 'Unauthorized change' }),
+      'Owner of another business cannot edit employee root profile',
+    ),
+    assertFails(
+      updateDoc(doc(otherOwner, 'businesses/business-a/users/employee-new'), { name: 'Unauthorized change' }),
+      'Owner of another business cannot edit employee membership',
+    ),
+    assertFails(
+      updateDoc(doc(otherOwner, 'businesses/business-a/employeeIds/NEW01'), { status: 'inactive' }),
+      'Owner of another business cannot change employee ID reservation',
+    ),
+  ]);
 
   const disableEmployeeBatch = writeBatch(owner);
   const disabledAt = new Date();

@@ -67,6 +67,12 @@ const defaultProfile = {
   phone: '08123456789',
 };
 
+const EMPLOYEE_ROLE_VALUES = new Set(['employee', 'pegawai']);
+
+function isEmployeeRole(role) {
+  return EMPLOYEE_ROLE_VALUES.has(role);
+}
+
 const ownerNavItems = [
   { label: 'Dashboard', path: '/', icon: '🏠' },
   { label: 'Penjualan', path: '/sales', icon: '🧾' },
@@ -682,19 +688,26 @@ export function AuthProvider({ children }) {
       throw new Error('Firebase belum dikonfigurasi. Isi environment variables lalu mulai ulang aplikasi.');
     }
 
+    const normalizedIdentifier = typeof identifier === 'string' ? identifier.trim() : '';
+    if (!normalizedIdentifier) {
+      throw new Error('ID Pegawai atau email wajib diisi.');
+    }
+
     setAuthError('');
     const result = loginRole === 'pegawai'
-      ? await signInEmployee(auth, identifier, password)
-      : await signInWithEmailAndPassword(auth, identifier.trim(), password);
+      ? await signInEmployee(auth, normalizedIdentifier, password)
+      : await signInWithEmailAndPassword(auth, normalizedIdentifier, password);
     let resolved;
     if (loginRole === 'owner') {
       resolved = await resolveOwnerSession(result.user);
     } else {
+      const employeeId = normalizedIdentifier;
+      const employeeEmail = employeeInternalEmail(employeeId);
       const profileSnapshot = await getDoc(doc(db, 'users', result.user.uid));
       const employeeProfile = profileSnapshot.exists() ? profileSnapshot.data() : null;
       if (!employeeProfile
         || employeeProfile.uid !== result.user.uid
-        || employeeProfile.role !== 'employee'
+        || !isEmployeeRole(employeeProfile.role)
         || employeeProfile.status !== 'active'
         || !employeeProfile.businessId) {
         await signOut(auth);
@@ -704,17 +717,19 @@ export function AuthProvider({ children }) {
         doc(db, 'businesses', employeeProfile.businessId, 'users', result.user.uid),
       );
       const membership = membershipSnapshot.exists() ? membershipSnapshot.data() : null;
+      const expectedEmployeeId = (employeeProfile.employeeId || '').trim();
+      const expectedAuthEmail = (employeeProfile.email || '').trim().toLowerCase();
+      const authEmail = (result.user.email || '').trim().toLowerCase();
       if (!membership
-        || membership.role !== 'employee'
+        || !isEmployeeRole(membership.role)
         || membership.status !== 'active'
         || membership.active === false
         || membership.uid !== result.user.uid
         || membership.authUid !== result.user.uid
         || membership.businessId !== employeeProfile.businessId
-        || membership.employeeId !== employeeProfile.employeeId
-        || employeeProfile.email?.toLowerCase() !== employeeInternalEmail(identifier).toLowerCase()
-        || membership.employeeId?.toLowerCase() !== identifier.trim().toLowerCase()
-        || result.user.email?.toLowerCase() !== employeeInternalEmail(identifier).toLowerCase()) {
+        || membership.employeeId !== expectedEmployeeId
+        || expectedAuthEmail !== employeeEmail.toLowerCase()
+        || authEmail !== employeeEmail.toLowerCase()) {
         await signOut(auth);
         throw new Error('Akun pegawai tidak terdaftar atau dinonaktifkan.');
       }
@@ -1124,8 +1139,7 @@ function App() {
     const linkedWithEmail = matchingEmails.docs.find((snapshot) => snapshot.id !== normalizedAuthUid);
     if (linkedWithEmail
       || data.users.some((person) => {
-        if (person.id === normalizedAuthUid
-          || (person.role !== 'employee' && person.role !== 'pegawai')) return false;
+        if (person.id === normalizedAuthUid || !isEmployeeRole(person.role)) return false;
         try {
           return employeeInternalEmail(person.employeeId) === email;
         } catch {
@@ -1152,13 +1166,13 @@ function App() {
           throw new Error('UID ini adalah akun Owner dan tidak dapat digunakan sebagai pegawai.');
         }
         if (currentRootProfile
-          && (currentRootProfile.role !== 'employee'
+          && (!isEmployeeRole(currentRootProfile.role)
             || currentRootProfile.businessId !== businessId
             || employeeIdKey(currentRootProfile.employeeId) !== reservationKey)) {
           throw new Error('Akun Firebase ini sudah terhubung dengan pegawai lain.');
         }
         if (currentMember
-          && (currentMember.role !== 'employee'
+          && (!isEmployeeRole(currentMember.role)
             || currentMember.businessId !== businessId
             || employeeIdKey(currentMember.employeeId) !== reservationKey)) {
           throw new Error('Akun Firebase ini sudah terhubung dengan pegawai lain.');
@@ -1239,10 +1253,11 @@ function App() {
       active,
       updatedAt: serverTimestamp(),
     };
+    const reservationKey = employeeIdKey(employee.employeeId);
     const batch = writeBatch(db);
     batch.update(doc(db, 'businesses', businessId, 'users', employeeUid), updates);
     batch.set(doc(db, 'users', employeeUid), updates, { merge: true });
-    batch.set(doc(db, 'businesses', businessId, 'employeeIds', employee.employeeId), updates, { merge: true });
+    batch.set(doc(db, 'businesses', businessId, 'employeeIds', reservationKey), updates, { merge: true });
     await batch.commit();
   };
 
@@ -1561,7 +1576,7 @@ function ProtectedLayout({
                   <Route path="/expenses" element={<ExpensePage data={data} addExpense={addExpense} deleteExpense={deleteExpense} />} />
                   <Route path="/menus" element={<MenuPage data={data} addMenu={addMenu} deleteMenu={deleteMenu} />} />
                   <Route path="/reports" element={<ReportsPage data={data} metrics={metrics} period={period} setPeriod={setPeriod} customStart={customStart} setCustomStart={setCustomStart} customEnd={customEnd} setCustomEnd={setCustomEnd} />} />
-                  <Route path="/employees" element={<EmployeesPage data={data} addEmployee={saveEmployee} updateEmployeeProfile={updateEmployeeProfile} updateEmployeeStatus={updateEmployeeStatus} />} />
+                  <Route path="/employees" element={<EmployeesPage data={data} addEmployee={addEmployee} updateEmployeeProfile={updateEmployeeProfile} updateEmployeeStatus={updateEmployeeStatus} />} />
                   <Route path="/settings" element={<SettingsPage data={data} saveProfile={saveProfile} addCapital={addCapital} deleteCapital={deleteCapital} exportBackup={exportBackup} importBackup={importBackup} />} />
                   <Route path="/capital" element={<SettingsPage data={data} saveProfile={saveProfile} addCapital={addCapital} deleteCapital={deleteCapital} exportBackup={exportBackup} importBackup={importBackup} />} />
                   </>
@@ -2629,7 +2644,7 @@ function EmployeesPage({ data, addEmployee, updateEmployeeProfile, updateEmploye
               onChange={(event) => setForm((previous) => ({ ...previous, employeeId: event.target.value }))}
               minLength={3}
               maxLength={20}
-              pattern="[^\\s/]+"
+              pattern="[^\\s\\/]+"
               readOnly={Boolean(editingId)}
               required
             />
@@ -2698,7 +2713,7 @@ function EmployeesPage({ data, addEmployee, updateEmployeeProfile, updateEmploye
                     placeholder="Tempel UID dari Firebase Console"
                     autoComplete="off"
                     maxLength={128}
-                    pattern="[^\\s/]+"
+                    pattern="[^\\s\\/]+"
                     required
                   />
                   <button className="btn-secondary shrink-0" type="button" onClick={handlePasteUid}>Tempel UID</button>
